@@ -1,4 +1,0 @@
-functions-framework
-flask
-notion-client
-google-generativeai
