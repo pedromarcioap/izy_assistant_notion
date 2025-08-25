@@ -1,84 +1,84 @@
-import functions_framework
-from flask import jsonify, request
-from notion_client import Client
+from flask import Flask, request, jsonify
+import requests
 import google.generativeai as genai
 import os
 
-# As chaves ficam em variáveis de ambiente do Firebase
-NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_KEY")
+app = Flask(__name__)
 
-notion = Client(auth=NOTION_TOKEN)
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
+GEMINI_KEY = os.environ.get("GEMINI_KEY")
+
 genai.configure(api_key=GEMINI_KEY)
+model = genai.GenerativeModel("gemini-pro")
 
-def processar_comando(page_id, block_id, conteudo, blocks):
-    if conteudo.strip().startswith("\\resumir"):
-        return executar_resumo(page_id, block_id, blocks)
-    elif conteudo.strip().startswith("\\traduzir"):
-        return executar_traducao(page_id, block_id, blocks, "en")
-    elif conteudo.strip().startswith("\\reescrever"):
-        return executar_reescrita(page_id, block_id, conteudo)
+NOTION_API_URL = "https://api.notion.com/v1"
+NOTION_HEADERS = {
+    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Content-Type": "application/json",
+    "Notion-Version": "2022-06-28",
+}
+
+def get_page_content(page_id):
+    url = f"{NOTION_API_URL}/blocks/{page_id}/children"
+    response = requests.get(url, headers=NOTION_HEADERS)
+    if response.status_code == 200:
+        data = response.json()
+        texts = []
+        for block in data.get("results", []):
+            if "paragraph" in block:
+                texts.append("".join([r["text"]["content"] for r in block["paragraph"]["rich_text"]]))
+        return "\n".join(texts)
     return None
 
-def executar_resumo(page_id, comando_block_id, blocks):
-    texto = coletar_texto(blocks)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    resp = model.generate_content(f"Resuma em português o seguinte texto:\n\n{texto}")
-    adicionar_bloco(page_id, resp.text, "✨ Resumo")
-    notion.blocks.delete(comando_block_id)
-
-def executar_traducao(page_id, comando_block_id, blocks, idioma_destino="en"):
-    texto = coletar_texto(blocks)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    resp = model.generate_content(f"Traduza para {idioma_destino} o seguinte texto:\n\n{texto}")
-    adicionar_bloco(page_id, resp.text, "🌎 Tradução")
-    notion.blocks.delete(comando_block_id)
-
-def executar_reescrita(page_id, comando_block_id, conteudo):
-    original = conteudo.replace("\\reescrever", "").strip()
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    resp = model.generate_content(f"Reescreva de forma mais clara:\n\n{original}")
-    adicionar_bloco(page_id, resp.text, "✍ Reescrita")
-    notion.blocks.delete(comando_block_id)
-
-def coletar_texto(blocks):
-    texto = []
-    for b in blocks:
-        if b["type"] in ("paragraph", "heading_1", "heading_2", "heading_3", "bulleted_list_item"):
-            rich = b[b["type"]]["rich_text"]
-            texto.append("".join([r["plain_text"] for r in rich]))
-    return "\n".join(texto)
-
-def adicionar_bloco(page_id, conteudo, titulo="💡 Resultado"):
-    notion.blocks.children.append(
-        page_id,
-        children=[{
-            "object": "block",
-            "type": "callout",
-            "callout": {
-                "rich_text": [{"type": "text", "text": {"content": f"{titulo}\n\n{conteudo}"}}],
-                "icon": {"emoji": "🤖"}
+def append_to_page(page_id, content):
+    url = f"{NOTION_API_URL}/blocks/{page_id}/children"
+    payload = {
+        "children": [
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{"type": "text", "text": {"content": content}}],
+                },
             }
-        }]
-    )
+        ]
+    }
+    requests.patch(url, headers=NOTION_HEADERS, json=payload)
 
-# 🔥 Entry point para Firebase
-@functions_framework.http
-def notion_webhook(request):
-    data = request.get_json(silent=True) or {}
+@app.route("/notion", methods=["POST"])
+def notion_webhook():
+    data = request.json
+    page_id = data.get("page_id")
+    command = data.get("command", "")
 
-    try:
-        page_id = data["payload"]["page"]["id"]
-        block_id = data["payload"]["block"]["id"]
-    except Exception:
-        return jsonify({"status": "ignored"}), 200
+    if not page_id or not command:
+        return jsonify({"error": "page_id and command required"}), 400
 
-    blocks = notion.blocks.children.list(page_id).get("results", [])
+    page_text = get_page_content(page_id)
 
-    for block in blocks:
-        if block["type"] == "paragraph":
-            text_items = block["paragraph"]["rich_text"]
-            conteudo = "".join([t["plain_text"] for t in text_items])
-            processar_comando(page_id, block["id"], conteudo, blocks)
+    if command.startswith("\\traduzir"):
+        prompt = f"Traduza o texto abaixo para português:\n\n{page_text}"
+    elif command.startswith("\\resumir"):
+        prompt = f"Resuma o seguinte texto:\n\n{page_text}"
+    elif command.startswith("\\reescrever"):
+        prompt = f"Reescreva de forma clara e organizada:\n\n{page_text}"
+    elif command.startswith("\\conversar"):
+        prompt = command.replace("\\conversar", "").strip()
+        if not prompt:
+            prompt = f"Converse sobre o seguinte texto:\n\n{page_text}"
+    else:
+        prompt = f"Você é uma IA ajudando no Notion. Execute o seguinte pedido:\n\n{command}\n\nTexto base:\n{page_text}"
 
-    return jsonify({"status": "ok"}), 200
+    response = model.generate_content(prompt)
+    ai_reply = response.text
+
+    append_to_page(page_id, ai_reply)
+
+    return jsonify({"reply": ai_reply})
+
+@app.route("/")
+def home():
+    return "✅ Notion + Gemini rodando no Render!"
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
